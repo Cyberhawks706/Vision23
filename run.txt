@@ -1,0 +1,1 @@
+python3 detect2.py --weights=best-int8.tflite --data=finalCustomData_2.yaml --source=http://wpilibpi.local:1181/stream.mjpg --nosave --imgsz 416
