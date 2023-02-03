@@ -41,6 +41,9 @@ import numpy as np
 import json
 import time
 from multiprocessing import Pool,Process
+import robotpy_apriltag
+from robotpy_apriltag import *
+import cv2
 
 import torch
 
@@ -86,25 +89,18 @@ def run(
         hide_conf=False,  # hide confidences
         half=False,  # use FP16 half-precision inference
         dnn=False,  # use OpenCV DNN for ONNX inference
-        vid_stride=1,  # video frame-rate stride
-        camID = 0
+        vid_stride=1  # video frame-rate stride
 ):
     with open('/boot/frc.json') as f:
         cameraConfig = json.load(f)
-    numCameras = len(cameraConfig['cameras'])
     camera = cameraConfig['cameras'][0]
     ntinst = NetworkTableInstance.getDefault()
     ntinst.startClient4(identity="wpilibpi")
     ntinst.startDSClient()
     ntinst.setServerTeam(team=706)
     ntinst.getTable("CameraPublisher").getSubTable("rawCam0").getEntry("streams").setStringArray(["mjpeg:http://wpilibpi.local:1181/?action=stream"])
-    usbCams = {}
-    output_streams = {}
-    sources = {}
-    datasets = {}
     width = camera['width']
     height = camera['height']
-
 
     webcam = True
 
@@ -116,85 +112,115 @@ def run(
     model = DetectMultiBackend(weights, device=device, dnn=dnn, data=data, fp16=half)
     stride, names, pt = model.stride, model.names, model.pt
     imgsz = check_img_size(imgsz, s=stride)  # check image size
-
     # Dataloader
     
-    for camID in range(numCameras):
-        usbCams[camID] = CameraServer.startAutomaticCapture(name=("rawCam" + str(camID)), path=("/dev/video" + str(camID * 2)))
-        usbCams[camID].setResolution(width, height)
-        output_streams[camID] = CameraServer.putVideo(("Processed" + str(camID)), width, height)
-        sources[camID] = "http://wpilibpi.local:" + str(1181 + camID * 2) + "/stream.mjpg"
-        datasets[camID] = LoadStreams(sources[camID], img_size=imgsz, stride=stride, auto=pt, vid_stride=vid_stride)
+    usbCam = CameraServer.startAutomaticCapture(name="rawCam0", path="/dev/video0")
+    usbCam.setResolution(width, height)
+    input_stream = CameraServer.getVideo(camera=usbCam)
+    output_stream = CameraServer.putVideo("Processed0", width, height)
+    source = "http://wpilibpi.local:1181/stream.mjpg"
+    dataset = LoadStreams(source, img_size=imgsz, stride=stride, auto=pt, vid_stride=vid_stride)
     time.sleep(0.5)
-
+    black_img = np.zeros(shape=(height, width, 3), dtype=np.uint8)
+    detector = AprilTagDetector()
+    detector.addFamily("tag16h5")
+    detectorConfig = detector.getConfig()
+    quad_params = detector.getQuadThresholdParameters()
+    detectorConfig.numThreads = 4
+    quad_params.maxLineFitMSE = 3
+    quad_params.minWhiteBlackDiff = 70
+    quad_params.criticalAngle = 20
+    detector.setConfig(detectorConfig)
+    detector.setQuadThresholdParameters(quad_params)
+    estimatorConfig = AprilTagPoseEstimator.Config(tagSize=0.1524, fx=1050, fy=1020, cx=width/2, cy=height/2)
+    poseEstimator = AprilTagPoseEstimator(estimatorConfig)
 
     # Run inference
-    model.warmup(imgsz=(len(datasets[0]), 3, *imgsz))  # warmup
+    model.warmup(imgsz=(len(dataset), 3, *imgsz))  # warmup
     seen, windows, dt = 0, [], (Profile(), Profile(), Profile())
-    #for path, im, im0s, vid_cap, s in datasets[0]:
-    for index in range(len(datasets[0])):
-        for camID in range(numCameras):
-            im = datasets[camID].imgs[index]
-            im0s = datasets[camID].imgs
-            s = ""
-            with dt[0]:
-                im = torch.from_numpy(im).to(model.device)
-                im = im.half() if model.fp16 else im.float()  # uint8 to fp16/32
-                im /= 255  # 0 - 255 to 0.0 - 1.0
-                if len(im.shape) == 3:
-                    im = im[None]  # expand for batch dim
+    for path, im, im0s, vid_cap, s in dataset:
 
-            # Inference
-            with dt[1]:
-                pred = model(im, augment=False, visualize=False)
 
-            # NMS
-            with dt[2]:
-                pred = non_max_suppression(pred, conf_thres, iou_thres, classes, agnostic_nms, max_det=max_det)
+        _, input_img = input_stream.grabFrame(black_img)
+        gray_img = cv2.cvtColor(input_img, cv2.COLOR_BGR2GRAY)
+        detections = detector.detect(gray_img)
+        corners = [[0,0],[0,0],[0,0],[0,0]]
+        
+        
 
-            # Second-stage classifier (optional)
-            # pred = utils.general.apply_classifier(pred, classifier_model, im, im0s)
+        with dt[0]:
+            im = torch.from_numpy(im).to(model.device)
+            im = im.half() if model.fp16 else im.float()  # uint8 to fp16/32
+            im /= 255  # 0 - 255 to 0.0 - 1.0
+            if len(im.shape) == 3:
+                im = im[None]  # expand for batch dim
 
-            # Process predictions
-            for i, det in enumerate(pred):  # per image
-                seen += 1
-                 # batch_size >= 1
-                im0, frame = im0s[i].copy(), datasets[camID].count
-                s += f'{i}: '
+        # Inference
+        with dt[1]:
+            pred = model(im, augment=False, visualize=False)
 
-                
-                s += '%gx%g ' % im.shape[2:]  # print string
-                gn = torch.tensor(im0.shape)[[1, 0, 1, 0]]  # normalization gain whwh
-                annotator = Annotator(im0, line_width=line_thickness, example=str(names))
-                if len(det):
-                    # Rescale boxes from img_size to im0 size
-                    det[:, :4] = scale_boxes(im.shape[2:], det[:, :4], im0.shape).round()
+        # NMS
+        with dt[2]:
+            pred = non_max_suppression(pred, conf_thres, iou_thres, classes, agnostic_nms, max_det=max_det)
 
-                    # Print results
-                    for c in det[:, 5].unique():
-                        n = (det[:, 5] == c).sum()  # detections per class
-                        s += f"{n} {names[int(c)]}{'s' * (n > 1)}, "  # add to string
+        # Second-stage classifier (optional)
+        # pred = utils.general.apply_classifier(pred, classifier_model, im, im0s)
 
-                    # Write results
-                    for *xyxy, conf, cls in reversed(det):
-                        xywh = (xyxy2xywh(torch.tensor(xyxy).view(1, 4)) / gn).view(-1).tolist()  # normalized xywh
-                        print("xCenter: " + str((int(xyxy[0]) + int(xyxy[2])) / 2))
-                        print("yCenter: " + str((int(xyxy[1]) + int(xyxy[3])) / 2))
+        # Process predictions
+        for i, det in enumerate(pred):  # per image
+            seen += 1
+                # batch_size >= 1
+            im0 = im0s[i].copy()
+            s += f'{i}: '
 
-                        # Add bbox to image
-                        c = int(cls)  # integer class
-                        label = None if hide_labels else (names[c] if hide_conf else f'{names[c]} {conf:.2f}')
-                        annotator.box_label(xyxy, label, color=colors(c, True))
+            s += '%gx%g ' % im.shape[2:]  # print string
+            gn = torch.tensor(im0.shape)[[1, 0, 1, 0]]  # normalization gain whwh
+            annotator = Annotator(im0, line_width=line_thickness, example=str(names))
+            if len(det):
+                # Rescale boxes from img_size to im0 size
+                det[:, :4] = scale_boxes(im.shape[2:], det[:, :4], im0.shape).round()
 
-                # Stream results
-                im0 = annotator.result()
-                output_streams[camID].putFrame(im0)
+                # Print results
+                for c in det[:, 5].unique():
+                    n = (det[:, 5] == c).sum()  # detections per class
+                    s += f"{n} {names[int(c)]}{'s' * (n > 1)}, "  # add to string
 
-                
-            # put video back to processed0
+                # Write results
+                for *xyxy, conf, cls in reversed(det):
+                    xywh = (xyxy2xywh(torch.tensor(xyxy).view(1, 4)) / gn).view(-1).tolist()  # normalized xywh
+                    print("xCenter: " + str((int(xyxy[0]) + int(xyxy[2])) / 2))
+                    print("yCenter: " + str((int(xyxy[1]) + int(xyxy[3])) / 2))
 
-            # Print time (inference-only)
-            LOGGER.info(f"{s}{'' if len(det) else '(no detections), '}{dt[1].dt * 1E3:.1f}ms")
+                    # Add bbox to image
+                    c = int(cls)  # integer class
+                    label = None if hide_labels else (names[c] if hide_conf else f'{names[c]} {conf:.2f}')
+                    annotator.box_label(xyxy, label, color=colors(c, True))
+
+
+            # Stream results
+            im0 = annotator.result()
+            if(detections):
+                for k in range(len(detections)):
+                    for i in range(len(corners)):
+                        corners[i][0] = detections[k].getCorner(i).x
+                        corners[i][1] = detections[k].getCorner(i).y
+                    center = (int(corners[0][0]), int(corners[0][1]))
+                    poseEstimate = poseEstimator.estimate(detections[k])
+                    cv2.polylines(im0, np.int32([corners]), True, (255,0,0), 5)
+                    cv2.putText(im0, str(detections[k].getId()), center, cv2.FONT_HERSHEY_SIMPLEX, 2, (0,0,255), 3)
+                    ntinst.getTable("SmartDashboard").getSubTable("processed0").putValue("tag" + str(detections[k].getId()), str(poseEstimate))
+                    print("tag" + str(detections[k].getId()) + ": ", str(poseEstimate))
+            output_stream.putFrame(im0)
+            for tagID in range(32):
+                table = ntinst.getTable("SmartDashboard").getSubTable("processed0")
+                if (table.containsKey("tag" + str(tagID))) and (ntcore._now() - table.getEntry("tag" + str(tagID)).getLastChange()) > 50000:
+                    table.getEntry("tag" + str(tagID)).unpublish()
+
+            
+        # put video back to processed0
+
+        # Print time (inference-only)
+        LOGGER.info(f"{s}{'' if len(det) else '(no detections), '}{dt[1].dt * 1E3:.1f}ms")
 
     # Print results
     t = tuple(x.t / seen * 1E3 for x in dt)  # speeds per image
